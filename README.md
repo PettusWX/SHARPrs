@@ -1,6 +1,15 @@
-# SHARPrs
+<h1 align="center">SHARPrs</h1>
 
-SHARPrs analyzes atmospheric soundings and draws SPC-style charts in Rust. Use the desktop app to inspect a profile, the CLI to render a forecast run, or the library to work with parcel and wind diagnostics in your own code.
+<p align="center"><strong>Analyze atmospheric soundings and draw customizable SPC-style charts in Rust.</strong></p>
+
+<p align="center">
+  <a href="https://github.com/PettusWX/SHARPrs/actions/workflows/desktop.yml"><img alt="Desktop package build" src="https://github.com/PettusWX/SHARPrs/actions/workflows/desktop.yml/badge.svg?branch=main"></a>
+  <a href="crates/sharprs-desktop"><img alt="Desktop GUI built with egui" src="https://img.shields.io/badge/desktop-egui-416579"></a>
+  <a href="crates/sharprs-core"><img alt="Analysis engine written in Rust" src="https://img.shields.io/badge/analysis-Rust-995333"></a>
+  <a href="LICENSE"><img alt="License BSD 3-Clause" src="https://img.shields.io/badge/license-BSD--3--Clause-34664F"></a>
+</p>
+
+Use the desktop app to inspect a profile, the CLI to render a forecast run, or the library to work with parcel and wind diagnostics in your own code.
 
 ![Observed Omaha sounding from June 16, 2014 at 19 UTC, with a Skew-T, hodograph, parcel diagnostics, and storm analogs](examples/omaha.png)
 
