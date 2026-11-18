@@ -122,6 +122,9 @@ impl Profile {
                 thermo::mixratio(totp / num, totd / num)
             }
             Scheme::Sampled => {
+                if let Some((g, n)) = self.sfc_prefix(pbot, ptop) {
+                    return masked_mean(&g.mixing_ratio(self)[..n]);
+                }
                 let p = arange(pbot, ptop - 1., -1.);
                 let d = self.many(Field::Dewpoint, &p);
                 let w: Vec<f64> = p.iter().zip(&d).map(|(&p, &d)| thermo::mixratio(p, d)).collect();
@@ -136,10 +139,16 @@ impl Profile {
         let Some((pbot, ptop)) = self.layer_bounds(pbot, ptop, Field::Temperature) else {
             return f64::NAN;
         };
+        if let Some((g, n)) = self.sfc_prefix(pbot, ptop) {
+            let t = g.tmpc(self);
+            let d = g.dwpc(self);
+            let rh: Vec<_> = (0..n).map(|i| thermo::relh(g.p[i], t[i], d[i])).collect();
+            return masked_average(&rh, &g.p[..n]);
+        }
         let p = arange(pbot, ptop - 1., -1.);
         let t = self.many(Field::Temperature, &p);
         let d = self.many(Field::Dewpoint, &p);
-        let rh: Vec<f64> = (0..p.len()).map(|i| thermo::relh(p[i], t[i], d[i])).collect();
+        let rh: Vec<_> = (0..p.len()).map(|i| thermo::relh(p[i], t[i], d[i])).collect();
         masked_average(&rh, &p)
     }
 
@@ -174,15 +183,22 @@ impl Profile {
         if self.plast() > ptop {
             ptop = self.plast();
         }
-        let p = arange(pbot, ptop - 1., -1.);
-        let d = self.many(Field::Dewpoint, &p);
-        let w: Vec<f64> = p.iter().zip(&d).map(|(&p, &d)| thermo::mixratio(p, d)).collect();
-        if w.len() < 2 {
+        let owned;
+        let (p, w) = if let Some((g, n)) = self.sfc_prefix(pbot, ptop) {
+            (&g.p[..n], &g.mixing_ratio(self)[..n])
+        } else {
+            let p = arange(pbot, ptop - 1., -1.);
+            let d = self.many(Field::Dewpoint, &p);
+            let w: Vec<_> = p.iter().zip(d).map(|(&p, d)| thermo::mixratio(p, d)).collect();
+            owned = (p, w);
+            (&owned.0[..], &owned.1[..])
+        };
+        if p.len() < 2 {
             return 0.;
         }
-        let terms: Vec<f64> = (0..w.len() - 1)
-            .map(|i| ((w[i] + w[i + 1]) / 2. * (p[i] - p[i + 1])) * 0.00040173)
-            .collect();
+        let terms: Vec<_> = (1..p.len()).map(|i| {
+            ((w[i - 1] + w[i]) / 2. * (p[i - 1] - p[i])) * 0.00040173
+        }).collect();
         numerics::masked_sum(&terms)
     }
 
@@ -230,31 +246,23 @@ impl Profile {
     /// temperature (or wet-bulb) profile crosses `temp`.
     pub(crate) fn temp_lvl_raw(&self, temp: f64, wetbulb: bool) -> f64 {
         let prof = if wetbulb { &self.wetbulb } else { &self.tmpc };
-        let difft: Vec<f64> = prof.iter().map(|t| t - temp).collect();
-        let any_le = difft.iter().any(|&d| d <= 0.);
-        let any_ge = difft.iter().any(|&d| d >= 0.);
-        if !any_le || !any_ge {
-            return f64::NAN;
-        }
-        if let Some(i) = difft.iter().position(|&d| d == 0.) {
+        if let Some(i) = prof.iter().position(|t| t - temp == 0.) {
             return self.pres[i];
         }
-        let mut d = Vec::new();
-        let mut pr = Vec::new();
-        let mut lp = Vec::new();
-        for i in 0..difft.len() {
-            if !difft[i].is_nan() && !self.logp[i].is_nan() {
-                d.push(difft[i]);
-                pr.push(prof[i]);
-                lp.push(self.logp[i]);
+        let mut previous = None;
+        for (&t, &lp) in prof.iter().zip(&self.logp) {
+            let diff = t - temp;
+            if diff.is_nan() || lp.is_nan() {
+                continue;
             }
+            if let Some((prev_t, prev_lp, prev_diff)) = previous {
+                if diff * prev_diff < 0. {
+                    return pow(10., numerics::interp_clamped(temp, &[t, prev_t], &[lp, prev_lp]));
+                }
+            }
+            previous = Some((t, lp, diff));
         }
-        let Some(ind) = (0..d.len().saturating_sub(1)).find(|&i| d[i] * d[i + 1] < 0.) else {
-            return f64::NAN;
-        };
-        // SHARPpy hands np.interp a 2-point xp that may be decreasing; we
-        // reproduce numpy's behaviour in that case too.
-        pow(10., numerics::interp_clamped(temp, &[pr[ind + 1], pr[ind]], &[lp[ind + 1], lp[ind]]))
+        f64::NAN
     }
 
     /// Forecast maximum temperature (°C): mix down from 100 hPa above the
@@ -276,18 +284,30 @@ impl Profile {
         if self.temp(ptop).is_nan() {
             return f64::NAN;
         }
-        let owned;
-        let (p, mt): (&[f64], &[f64]) = match self.sfc_prefix(pbot, ptop) {
-            Some((g, n)) if n <= g.mu_tw(self).len() => (&g.p[..n], &g.mu_tw(self)[..n]),
-            _ => {
-                let p = arange(pbot, ptop - 1., -1.);
-                let t = self.many(Field::Temperature, &p);
-                let d = self.many(Field::Dewpoint, &p);
-                let mt: Vec<f64> = (0..p.len()).map(|i| mu_value(p[i], t[i], d[i])).collect();
-                owned = (p, mt);
-                (&owned.0, &owned.1)
+        if let Some((g, n)) = self.sfc_prefix(pbot, ptop) {
+            let estimates = g.mu_estimates(self);
+            if n <= estimates.len() {
+                let estimates = &estimates[..n];
+                let best = estimates.iter().copied().fold(f64::NAN, f64::max);
+                let t = g.tmpc(self);
+                let d = g.dwpc(self);
+                // Allow for roundoff from the inverse dry lift and for ties at
+                // the reference tolerance. Only the exact lifts decide the level.
+                let mut candidates = Vec::new();
+                for (i, &estimate) in estimates.iter().enumerate() {
+                    if estimate >= best - 1e-5 {
+                        candidates.push((g.p[i], mu_value(g.p[i], t[i], d[i])));
+                    }
+                }
+                let max = candidates.iter().fold(f64::NAN, |max, &(_, v)| max.max(v));
+                return candidates.into_iter().find(|&(_, v)| (v - max).abs() < crate::units::TOL)
+                    .map_or(f64::NAN, |(p, _)| p);
             }
-        };
+        }
+        let p = arange(pbot, ptop - 1., -1.);
+        let t = self.many(Field::Temperature, &p);
+        let d = self.many(Field::Dewpoint, &p);
+        let mt: Vec<f64> = (0..p.len()).map(|i| mu_value(p[i], t[i], d[i])).collect();
         let max = mt.iter().copied().filter(|x| !x.is_nan()).fold(f64::NAN, f64::max);
         match mt.iter().position(|&m| (m - max).abs() < crate::units::TOL) {
             Some(i) => p[i],
@@ -298,13 +318,10 @@ impl Profile {
     /// Top of the PBL (hPa): first level where theta-v exceeds the surface
     /// theta-v by 0.5 K.
     pub(crate) fn pbl_top_raw(&self) -> f64 {
-        let thetav: Vec<f64> = (0..self.len())
-            .map(|i| {
-                let vt = virtemp_masked(self.pres[i], self.tmpc[i], self.dwpc[i]);
-                thermo::theta(self.pres[i], vt, 1000.)
-            })
-            .collect();
-        let s = thetav[self.sfc] + 0.5;
+        let thetav = |i: usize| {
+            if self.dwpc[i].is_nan() { f64::NAN } else { thermo::theta_k(self.vtmp[i], self.rocp_inv[i]) }
+        };
+        let s = thetav(self.sfc) + 0.5;
         // SHARPpy quirk: `np.where` on the masked theta-v array also sees the
         // raw data behind masked entries; where only the dewpoint is missing
         // that data is the temperature in K (~250-310), which always exceeds
@@ -312,7 +329,7 @@ impl Profile {
         let level = (0..self.len())
             .position(|i| {
                 let masked_td = self.dwpc[i].is_nan() && !self.tmpc[i].is_nan() && !self.pres[i].is_nan();
-                (masked_td && s < thermo::ctok(self.tmpc[i])) || s < thetav[i]
+                (masked_td && s < thermo::ctok(self.tmpc[i])) || s < thetav(i)
             })
             .unwrap_or(self.len() - 1);
         self.pres[level]
@@ -339,6 +356,18 @@ impl Profile {
 pub(crate) fn mu_value(p: f64, t: f64, td: f64) -> f64 {
     let (p2, t2) = thermo::drylift(p, t, td);
     thermo::wetlift(p2, t2, 1000.)
+}
+
+/// Potential temperature is conserved on the dry ascent to the LCL. For
+/// ranking candidates this cancels the pressure exponent and its inverse.
+pub(crate) fn mu_estimate(p: f64, t: f64, td: f64) -> f64 {
+    let theta = thermo::theta(p, t, 1000.);
+    let lcl = thermo::lcltemp(t, td);
+    if (-100.0..=100.0).contains(&theta) && (-100.0..=60.0).contains(&lcl) {
+        theta - thermo::wobus_estimate(theta) + thermo::wobus_estimate(lcl)
+    } else {
+        mu_value(p, t, td)
+    }
 }
 
 /// Array-style `virtemp` (masked when the dewpoint is masked; no fallback).

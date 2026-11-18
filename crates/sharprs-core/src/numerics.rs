@@ -129,8 +129,7 @@ pub(crate) fn masked_sum(a: &[f64]) -> f64 {
     if a.iter().all(|x| x.is_nan()) {
         return f64::NAN;
     }
-    let filled: Vec<f64> = a.iter().map(|&x| if x.is_nan() { 0. } else { x }).collect();
-    pairwise_sum(&filled)
+    pairwise_sum_by(0, a.len(), &|i| if a[i].is_nan() { 0. } else { a[i] })
 }
 
 /// Sum of the entries selected by `pred` (`x[x > 0].sum()` idiom).
@@ -154,17 +153,9 @@ pub(crate) fn masked_average(a: &[f64], w: &[f64]) -> f64 {
     if a.iter().all(|x| x.is_nan()) {
         return f64::NAN;
     }
-    let wgt: Vec<f64> = a
-        .iter()
-        .zip(w)
-        .map(|(&x, &wi)| if x.is_nan() { 0. } else { wi })
-        .collect();
-    let prod: Vec<f64> = a
-        .iter()
-        .zip(&wgt)
-        .map(|(&x, &wi)| if x.is_nan() { 0. } else { x * wi })
-        .collect();
-    pairwise_sum(&prod) / pairwise_sum(&wgt)
+    let sum = pairwise_sum_by(0, a.len(), &|i| if a[i].is_nan() { 0. } else { a[i] * w[i] });
+    let weight = pairwise_sum_by(0, a.len(), &|i| if a[i].is_nan() { 0. } else { w[i] });
+    sum / weight
 }
 
 /// `np.arange(start, stop, step)` for float64, including NumPy's way of

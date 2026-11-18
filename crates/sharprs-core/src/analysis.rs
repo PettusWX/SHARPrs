@@ -327,7 +327,55 @@ struct Work {
     eff_layer: Option<(f64, f64)>,
     ebotm: f64,
     etopm: f64,
-    storm: (f64, f64, f64, f64),
+}
+
+/// Concurrent callers already distribute profiles across cores. Only a lone
+/// analysis borrows extra workers for its independent diagnostics.
+struct AnalysisWorkers {
+    pool: Option<&'static rayon::ThreadPool>,
+}
+
+static ACTIVE_ANALYSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl AnalysisWorkers {
+    fn acquire() -> Self {
+        use std::sync::OnceLock;
+        static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+        let active = ACTIVE_ANALYSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pool = if active == 0 {
+            POOL.get_or_init(|| {
+                // Keep short parcel jobs on a few workers. Waking a worker
+                // per core costs more than the work on typical profiles.
+                let cpus = std::thread::available_parallelism().ok()?.get();
+                let threads = cpus.saturating_sub(1).min(5);
+                if threads == 0 { return None; }
+                rayon::ThreadPoolBuilder::new().num_threads(threads)
+                    .thread_name(|i| format!("sharprs-analysis-{i}")).build().ok()
+            }).as_ref()
+        } else {
+            None
+        };
+        Self { pool }
+    }
+
+    fn join<A: Send, B: Send>(&self, a: impl FnOnce() -> A + Send, b: impl FnOnce() -> B + Send) -> (A, B) {
+        let Some(pool) = self.pool else { return (a(), b()); };
+        if pool.current_thread_index().is_some() {
+            return rayon::join(a, b);
+        }
+        let mut other = None;
+        let first = pool.in_place_scope(|scope| {
+            scope.spawn(|_| other = Some(b()));
+            a()
+        });
+        (first, other.expect("scoped diagnostic completed"))
+    }
+}
+
+impl Drop for AnalysisWorkers {
+    fn drop(&mut self) {
+        ACTIVE_ANALYSES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl ConvectiveAnalysis {
@@ -360,48 +408,26 @@ impl ConvectiveAnalysis {
         let lat = prof.meta.latitude.filter(|l| !l.is_nan());
         let south = lat.is_some_and(|l| l < 0.);
 
-        // ---------------- parcels ---------------------------------------
-        let mu = prof.lift_raw(&prof.parcel_spec(ParcelKind::MostUnstable));
-        let sfc = if mu.pres == prof.psfc() {
-            let mut s = mu.clone();
-            s.kind = ParcelKind::Surface;
-            s
-        } else {
-            prof.lift_raw(&prof.parcel_spec(ParcelKind::Surface))
-        };
-        mark("parcel mu+sfc");
-        let fcst = prof.lift_raw(&prof.parcel_spec(ParcelKind::Forecast));
-        mark("parcel fcst");
-        let ml = prof.lift_raw(&prof.parcel_spec(ParcelKind::MixedLayer));
-        mark("parcel ml");
-        let (ebot, etop) = prof.effective_inflow_layer_raw(mu.bplus, mu.bminus);
-        mark("effective layer");
-        let eff_layer = if ebot.is_nan() || etop.is_nan() { None } else { Some((ebot, etop)) };
-        let (eff, ebotm, etopm) = match eff_layer {
-            None => {
-                let mut e = sfc.clone();
-                e.kind = ParcelKind::Effective;
-                (e, f64::NAN, f64::NAN)
-            }
-            Some((pb, pt)) => {
-                let ebotm = prof.agl(prof.hght(pb));
-                let etopm = prof.agl(prof.hght(pt));
-                let mtha = prof.mean_theta_raw(Some(pb), Some(pt), Scheme::Sampled);
-                let mmr = prof.mean_mixratio_raw(Some(pb), Some(pt), Scheme::Sampled);
-                let effpres = (pb + pt) / 2.;
-                let spec = ParcelSpec {
-                    kind: ParcelKind::Effective,
-                    pres: effpres,
-                    tmpc: thermo::theta(1000., mtha, effpres),
-                    dwpc: thermo::temp_at_mixrat(mmr, effpres),
-                };
-                (prof.lift_raw(&spec), ebotm, etopm)
-            }
-        };
-        mark("parcel eff");
-        let user = opts.user_parcel.as_ref().map(|s| prof.lift(s));
+        let workers = AnalysisWorkers::acquire();
+        let standard_parcels = || workers.join(
+            || prof.lift_raw(&prof.parcel_spec(ParcelKind::Forecast)),
+            || prof.lift_raw(&prof.parcel_spec(ParcelKind::MixedLayer)),
+        );
+        let weather = || workers.join(|| Self::fire(prof), || Self::winter(prof));
+        let environment = || workers.join(
+            || workers.join(|| Self::thermo_indices(prof), weather),
+            || Self::background(prof, opts),
+        );
+        let (main_parcels, other) =
+            workers.join(|| Self::inflow_parcels(prof, &workers), || workers.join(standard_parcels, environment));
+        let ((fcst, ml), (weather, background)) = other;
+        let (thermo_ix, (fire, winter)) = weather;
+        let (mu, sfc, eff_layer) = main_parcels;
+        let (ebotm, etopm) = eff_layer.map_or((f64::NAN, f64::NAN), |(pb, pt)| {
+            (prof.agl(prof.hght(pb)), prof.agl(prof.hght(pt)))
+        });
+        mark("parcels and thermodynamics");
 
-        // ---------------- storm motion -----------------------------------
         let bunkers = match eff_layer {
             None => prof.non_parcel_bunkers_raw(),
             Some((pb, _)) => prof.bunkers_raw(mu.bplus, mu.elhght, pb),
@@ -410,56 +436,38 @@ impl ConvectiveAnalysis {
             Some(sm) => (sm.right.u, sm.right.v, sm.left.u, sm.left.v),
             None => bunkers,
         };
-        let mut w = Work { mu, sfc, ml, eff_layer, ebotm, etopm, storm: bunkers };
-        mark("parcel user + bunkers");
+        let w = Work { mu, sfc, ml, eff_layer, ebotm, etopm };
 
-        let initial = Self::kinematics(prof, &w, bunkers);
-        let sars = Self::sars(prof, &w, &initial);
-        w.storm = storm;
-        let kinematics = if opts.storm_motion.is_some() {
-            Self::kinematics(prof, &w, bunkers)
-        } else {
-            initial
+        let (downdraft, pw_flag, temp_advection, user) = background;
+        let build_parcels = || {
+            let parcels = Parcels {
+                sfc: w.sfc.to_public(),
+                fcst: fcst.to_public(),
+                ml: w.ml.to_public(),
+                mu: w.mu.to_public(),
+                eff: Self::effective_parcel(prof, &w.sfc, eff_layer).to_public(),
+                user,
+            };
+            let slinky = prof.parcel_trajectory(&parcels.mu, Vector::new(bunkers.0, bunkers.1));
+            (parcels, slinky)
         };
-        mark("kinematics");
-        let thermo_ix = Self::thermo_indices(prof);
-        mark("thermo indices");
-        let fire = Self::fire(prof);
-        mark("fire");
-        let winter = Self::winter(prof);
-        mark("winter");
-        let (dcape, dt, dp) = prof.dcape_raw();
-        let downdraft = Downdraft {
-            dcape: opt(dcape),
-            trace: dp.iter().zip(&dt).filter(|(p, t)| !p.is_nan() && !t.is_nan()).map(|(&p, &t)| (p, t)).collect(),
-            downt_f: dt.last().and_then(|&t| opt(thermo::ctof(t))),
+        let storm_diagnostics = || {
+            let initial = Self::kinematics(prof, &w, bunkers, bunkers);
+            let severe_for = |kin: &Kinematics| Self::severe(prof, &w, kin, &thermo_ix, downdraft.dcape.unwrap_or(f64::NAN), south);
+            let (sars, (updated, severe)) = workers.join(|| Self::sars(prof, &w, &initial), || {
+                if opts.storm_motion.is_some() {
+                    let kin = Self::kinematics(prof, &w, bunkers, storm);
+                    let severe = severe_for(&kin);
+                    (Some(kin), severe)
+                } else {
+                    (None, severe_for(&initial))
+                }
+            });
+            let kin = updated.unwrap_or(initial);
+            (kin, sars, severe)
         };
-        mark("dcape");
-        let severe = Self::severe(prof, &w, &kinematics, &thermo_ix, dcape, south);
-        mark("severe");
-
-        let pw_flag = match (&prof.meta.station, prof.meta.valid) {
-            (Some(st), Some(dt)) => {
-                let pw300 = prof.precip_water_raw(None, 300.);
-                Some(climo::pw_flag(pw300, Some(st.as_str()), dt.month))
-            }
-            _ => None,
-        };
-
-        mark("pw flag");
-        let temp_advection = prof.inferred_temp_adv_raw(lat);
-        mark("temp advection");
-
-        let parcels = Parcels {
-            sfc: w.sfc.to_public(),
-            fcst: fcst.to_public(),
-            ml: w.ml.to_public(),
-            mu: w.mu.to_public(),
-            eff: eff.to_public(),
-            user,
-        };
-        let slinky = prof.parcel_trajectory(&parcels.mu, Vector::new(bunkers.0, bunkers.1));
-        mark("slinky");
+        let ((parcels, slinky), (kinematics, sars, severe)) = workers.join(build_parcels, storm_diagnostics);
+        mark("parcel traces and storm diagnostics");
         let effective_layer = eff_layer.map(|(pbot, ptop)| EffectiveLayer { pbot, ptop, hbot: ebotm, htop: etopm });
         let storm_motion = (!storm.0.is_nan() && !storm.2.is_nan()).then(|| StormMotion {
             right: Vector::new(storm.0, storm.1),
@@ -492,6 +500,67 @@ impl ConvectiveAnalysis {
         out
     }
 
+    fn background(prof: &Profile, opts: &AnalysisOptions) -> (Downdraft, Option<i8>, Vec<AdvectionLayer>, Option<Parcel>) {
+        let (dcape, dt, dp) = prof.dcape_raw();
+        let downdraft = Downdraft {
+            dcape: opt(dcape),
+            trace: dp.iter().zip(&dt).filter(|(p, t)| !p.is_nan() && !t.is_nan()).map(|(&p, &t)| (p, t)).collect(),
+            downt_f: dt.last().and_then(|&t| opt(thermo::ctof(t))),
+        };
+        let pw_flag = match (&prof.meta.station, prof.meta.valid) {
+            (Some(st), Some(dt)) => {
+                let pw300 = prof.precip_water_raw(None, 300.);
+                Some(climo::pw_flag(pw300, Some(st.as_str()), dt.month))
+            }
+            _ => None,
+        };
+        let temp_advection = prof.inferred_temp_adv_raw(prof.meta.latitude.filter(|x| !x.is_nan()));
+        let user = opts.user_parcel.as_ref().map(|s| prof.lift(s));
+        (downdraft, pw_flag, temp_advection, user)
+    }
+
+    fn inflow_parcels(prof: &Profile, workers: &AnalysisWorkers) -> (RawParcel, RawParcel, Option<(f64, f64)>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = AtomicBool::new(false);
+        let ((mu, sfc), layer) = workers.join(|| {
+            let mu = prof.lift_raw(&prof.parcel_spec(ParcelKind::MostUnstable));
+            let eligible = mu.bplus >= 100. && mu.bminus > -250.;
+            cancelled.store(!eligible, Ordering::Relaxed);
+            let sfc = if mu.pres == prof.psfc() {
+                let mut parcel = mu.clone();
+                parcel.kind = ParcelKind::Surface;
+                parcel
+            } else {
+                prof.lift_raw(&prof.parcel_spec(ParcelKind::Surface))
+            };
+            (mu, sfc)
+        }, || prof.inflow_pressures(&cancelled, workers.pool.is_some()));
+        let eff_layer = if cancelled.into_inner() { None } else { layer };
+        (mu, sfc, eff_layer)
+    }
+
+    fn effective_parcel(prof: &Profile, sfc: &RawParcel, layer: Option<(f64, f64)>) -> RawParcel {
+        match layer {
+            None => {
+                let mut e = sfc.clone();
+                e.kind = ParcelKind::Effective;
+                e
+            }
+            Some((pb, pt)) => {
+                let mtha = prof.mean_theta_raw(Some(pb), Some(pt), Scheme::Sampled);
+                let mmr = prof.mean_mixratio_raw(Some(pb), Some(pt), Scheme::Sampled);
+                let effpres = (pb + pt) / 2.;
+                let spec = ParcelSpec {
+                    kind: ParcelKind::Effective,
+                    pres: effpres,
+                    tmpc: thermo::theta(1000., mtha, effpres),
+                    dwpc: thermo::temp_at_mixrat(mmr, effpres),
+                };
+                prof.lift_raw(&spec)
+            }
+        }
+    }
+
     /// Storm-slinky for an arbitrary parcel and storm motion.
     pub fn slinky_for(prof: &Profile, parcel_spec: &ParcelSpec, storm: Vector) -> Option<Slinky> {
         prof.parcel_trajectory(&prof.lift(parcel_spec), storm)
@@ -503,7 +572,7 @@ impl ConvectiveAnalysis {
     }
 
     // ----------------------------------------------------------------------
-    fn kinematics(prof: &Profile, w: &Work, bunkers: (f64, f64, f64, f64)) -> Kinematics {
+    fn kinematics(prof: &Profile, w: &Work, bunkers: (f64, f64, f64, f64), storm: (f64, f64, f64, f64)) -> Kinematics {
         let sfc = prof.psfc();
         let hs = [1000., 3000., 4000., 5000., 6000., 8000., 9000.].map(|h| prof.msl(h));
         let ps = prof.pres_many(&hs);
@@ -592,7 +661,7 @@ impl ConvectiveAnalysis {
             corfidi: vec_opt(cu, cv).zip(vec_opt(du, dv)).map(|(a, b)| Corfidi { upshear: a, downshear: b }),
             bunkers: sm(bunkers),
             bunkers_non_parcel: sm(np),
-            storm_relative: Deviant { right: sr(w.storm.0, w.storm.1), left: sr(w.storm.2, w.storm.3) },
+            storm_relative: Deviant { right: sr(storm.0, storm.1), left: sr(storm.2, storm.3) },
         }
     }
 

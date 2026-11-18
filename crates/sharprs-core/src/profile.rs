@@ -233,12 +233,13 @@ pub(crate) struct SfcGrid {
     tmpc: OnceLock<Vec<f64>>,
     dwpc: OnceLock<Vec<f64>>,
     hght: OnceLock<Vec<f64>>,
+    mixing_ratio: OnceLock<Vec<f64>>,
     /// Environmental term of the sub-LCL CIN integrand:
     /// `virtemp_masked(p, theta(p, tmpc, 1000), dwpc)`.
-    dry_env: OnceLock<Vec<f64>>,
-    /// Most-unstable-level search value `wetlift(drylift(p, t, td), 1000)`
+    dry_env: OnceLock<Vec<OnceLock<Vec<f64>>>>,
+    /// Wet-bulb potential temperature estimates used to shortlist most-unstable parcels
     /// over the lowest 500 hPa (the deepest search SHARPpy does).
-    mu_tw: OnceLock<Vec<f64>>,
+    mu_estimates: OnceLock<Vec<f64>>,
 }
 
 /// Lazily filled intermediates shared between computations on one profile
@@ -246,6 +247,7 @@ pub(crate) struct SfcGrid {
 #[derive(Default)]
 pub(crate) struct Cache {
     sfc: OnceLock<SfcGrid>,
+    freezing_levels: OnceLock<[(f64, f64); 4]>,
     /// Memoised pressure-weighted mean winds: (pbot bits, ptop bits, u, v).
     mean_wind: Mutex<Vec<(u64, u64, f64, f64)>>,
 }
@@ -253,7 +255,7 @@ pub(crate) struct Cache {
 impl Clone for Cache {
     fn clone(&self) -> Self {
         let mw = self.mean_wind.lock().map(|m| m.clone()).unwrap_or_default();
-        Cache { sfc: self.sfc.clone(), mean_wind: Mutex::new(mw) }
+        Cache { sfc: self.sfc.clone(), freezing_levels: self.freezing_levels.clone(), mean_wind: Mutex::new(mw) }
     }
 }
 
@@ -468,11 +470,15 @@ impl Profile {
         let sfc = tmpc.iter().position(|t| !t.is_nan()).ok_or(ProfileError::NoTemperature)?;
         let top = tmpc.iter().rposition(|t| !t.is_nan()).ok_or(ProfileError::NoTemperature)?;
 
-        let logp: Vec<f64> = pres.iter().map(|p| p.log10()).collect();
-        // per-level pow factors reused by every theta / moist-lift step that
-        // starts or ends on a level (bit-identical to computing them inline)
-        let rocp_inv: Vec<f64> = pres.iter().map(|&p| pow(1000. / p, thermo::ROCP)).collect();
-        let rocp_fwd: Vec<f64> = pres.iter().map(|&p| pow(p / 1000., thermo::ROCP)).collect();
+        let mut logp = Vec::with_capacity(n);
+        let mut rocp_inv = Vec::with_capacity(n);
+        let mut rocp_fwd = Vec::with_capacity(n);
+        for &p in &pres {
+            let factors = thermo::PressureFactors::at(p);
+            logp.push(factors.log);
+            rocp_inv.push(factors.inverse);
+            rocp_fwd.push(factors.forward);
+        }
         // thetae = theta(100, wetlift(lcl, tlcl, 100), 1000)
         let k_100 = pow(100. / 1000., thermo::ROCP);
         let k_10 = pow(1000. / 100., thermo::ROCP);
@@ -791,10 +797,17 @@ impl Profile {
     // ------------------------------------------------------------------
     // shared caches
     // ------------------------------------------------------------------
+    pub(crate) fn parcel_temperature_levels(&self) -> &[(f64, f64); 4] {
+        self.cache.freezing_levels.get_or_init(|| [0., -10., -20., -30.].map(|t| {
+            let p = self.temp_lvl_raw(t, false);
+            (p, self.hght(p))
+        }))
+    }
+
     pub(crate) fn sfc_grid(&self) -> &SfcGrid {
         self.cache.sfc.get_or_init(|| {
             let p = arange(self.psfc(), self.plast() - 1., -1.);
-            let lp = p.iter().map(|p| p.log10()).collect();
+            let lp = p.iter().map(|&p| thermo::PressureFactors::log_pressure(p)).collect();
             SfcGrid { p, lp, ..Default::default() }
         })
     }
@@ -865,20 +878,32 @@ impl SfcGrid {
     pub(crate) fn hght(&self, prof: &Profile) -> &[f64] {
         self.hght.get_or_init(|| prof.t.hght.at_many(&self.lp))
     }
-    pub(crate) fn dry_env(&self, prof: &Profile) -> &[f64] {
-        self.dry_env.get_or_init(|| {
-            let t = self.tmpc(prof);
-            let d = self.dwpc(prof);
-            (0..self.p.len()).map(|k| crate::parcel::dry_env_tv(self.p[k], t[k], d[k])).collect()
+    pub(crate) fn mixing_ratio(&self, prof: &Profile) -> &[f64] {
+        self.mixing_ratio.get_or_init(|| {
+            self.p.iter().zip(self.dwpc(prof)).map(|(&p, &d)| thermo::mixratio(p, d)).collect()
         })
     }
-    pub(crate) fn mu_tw(&self, prof: &Profile) -> &[f64] {
-        self.mu_tw.get_or_init(|| {
+
+    /// A parcel usually reaches its LCL in the lowest part of the grid.
+    /// Fill the environmental column in blocks as deeper ascents need it.
+    pub(crate) fn dry_env_at(&self, prof: &Profile, k: usize) -> f64 {
+        const BLOCK: usize = 64;
+        let blocks = self.dry_env.get_or_init(|| (0..self.p.len().div_ceil(BLOCK)).map(|_| OnceLock::new()).collect());
+        let first = k / BLOCK * BLOCK;
+        let values = blocks[k / BLOCK].get_or_init(|| {
+            let t = self.tmpc(prof);
+            let d = self.dwpc(prof);
+            (first..(first + BLOCK).min(self.p.len())).map(|i| crate::parcel::dry_env_tv(self.p[i], t[i], d[i])).collect()
+        });
+        values[k - first]
+    }
+    pub(crate) fn mu_estimates(&self, prof: &Profile) -> &[f64] {
+        self.mu_estimates.get_or_init(|| {
             let psfc = prof.psfc();
             let n = arange_len(psfc, (psfc - 500.) - 1., -1.).min(self.p.len());
             let t = self.tmpc(prof);
             let d = self.dwpc(prof);
-            (0..n).map(|k| crate::layer::mu_value(self.p[k], t[k], d[k])).collect()
+            (0..n).map(|k| crate::layer::mu_estimate(self.p[k], t[k], d[k])).collect()
         })
     }
 }

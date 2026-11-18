@@ -24,11 +24,54 @@ pub const EPS: f64 = 0.62197;
 
 use crate::numerics::pow;
 
+/// Log pressure and Exner factors recur in interpolation and dry lifts.
+/// Use the native result for each exact tenth of a hectopascal. Off-grid
+/// pressures always go through the same original floating-point operations.
+#[derive(Clone, Copy)]
+pub(crate) struct PressureFactors {
+    pub log: f64,
+    pub inverse: f64,
+    pub forward: f64,
+}
+
+impl PressureFactors {
+    fn new(p: f64) -> Self {
+        Self { log: p.log10(), inverse: pow(1000. / p, ROCP), forward: pow(p / 1000., ROCP) }
+    }
+
+    #[inline]
+    fn lookup(p: f64) -> Option<Self> {
+        use std::sync::OnceLock;
+        static GRID: [OnceLock<[PressureFactors; 10]>; 1101] = [const { OnceLock::new() }; 1101];
+        let tenth = (p * 10.) as usize;
+        if tenth == 0 || tenth >= GRID.len() * 10 || p != tenth as f64 / 10. {
+            return None;
+        }
+        let row = tenth / 10;
+        Some(GRID[row].get_or_init(|| std::array::from_fn(|i| Self::new((row * 10 + i) as f64 / 10.)))[tenth % 10])
+    }
+
+    #[inline]
+    pub(crate) fn at(p: f64) -> Self {
+        Self::lookup(p).unwrap_or_else(|| Self::new(p))
+    }
+
+    #[inline]
+    pub(crate) fn log_pressure(p: f64) -> f64 {
+        Self::lookup(p).map_or_else(|| p.log10(), |f| f.log)
+    }
+}
+
 /// Potential temperature (°C) of air at `p_hpa`/`t_c`, referenced to
 /// `p2_hpa` (SHARPpy's default reference is 1000 hPa).
 #[inline]
 pub fn theta(p_hpa: f64, t_c: f64, p2_hpa: f64) -> f64 {
-    ((t_c + ZEROCNK) * pow(p2_hpa / p_hpa, ROCP)) - ZEROCNK
+    let factor = if p2_hpa == 1000. {
+        PressureFactors::lookup(p_hpa).map_or_else(|| pow(1000. / p_hpa, ROCP), |f| f.inverse)
+    } else {
+        pow(p2_hpa / p_hpa, ROCP)
+    };
+    theta_k(t_c, factor)
 }
 
 /// Pressure (hPa) at which a parcel with potential temperature `theta_c`
@@ -56,25 +99,67 @@ pub fn drylift(p: f64, t: f64, td: f64) -> (f64, f64) {
     (p2, t2)
 }
 
+/// Square a two-part significand, retaining the product's rounding residual.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline]
+fn square_pair(hi: f64, lo: f64) -> (f64, f64) {
+    let product = hi * hi;
+    let residual = hi.mul_add(hi, -product) + (2. * hi) * lo;
+    let rounded = product + residual;
+    (rounded, residual - (rounded - product))
+}
+
+#[inline]
+fn polynomial_power<const N: i32>(x: f64) -> f64 {
+    // Wobus and vapor-pressure polynomials stay near unity in the atmosphere.
+    // Outside this range use libm's overflow, underflow and nonfinite handling.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    if (0.01..=100.).contains(&x) {
+        let hi = x * x;
+        let lo = x.mul_add(x, -hi);
+        let (hi, lo) = square_pair(hi, lo);
+        let (hi, lo) = if N == 8 { square_pair(hi, lo) } else { (hi, lo) };
+        // libm and the rounded product can choose opposite neighbors near a
+        // midpoint. Preserve libm's choice there: one ulp can change the
+        // number of secant iterations in a saturated parcel lift.
+        let neighbor = if lo < 0. { hi.to_bits() - 1 } else { hi.to_bits() + 1 };
+        let spacing = (f64::from_bits(neighbor) - hi).abs();
+        if lo.abs() < 0.375 * spacing {
+            return hi;
+        }
+    }
+    pow(x, f64::from(N))
+}
+
 /// The Wobus function: correction (°C) between potential temperature and
 /// saturated potential temperature. SHARPpy (like SHARP) ignores the slight
 /// pressure dependency noted by Davies-Jones (2008); so do we.
 #[inline]
 pub fn wobf(t: f64) -> f64 {
+    wobus_polynomial(t, polynomial_power::<4>)
+}
+
+#[inline]
+pub(crate) fn wobus_estimate(t: f64) -> f64 {
+    wobus_polynomial(t, |p| p.powi(4))
+}
+
+#[inline]
+fn wobus_polynomial(t: f64, fourth: impl Fn(f64) -> f64) -> f64 {
     let t = t - 20.;
     if t <= 0. {
         let npol = 1.
             + t * (-8.841660499999999e-3
                 + t * (1.4714143e-4
                     + t * (-9.671989000000001e-7 + t * (-3.2607217e-8 + t * (-3.8598073e-10)))));
-        15.13 / pow(npol, 4.0)
+        15.13 / fourth(npol)
     } else {
         let ppol = t
             * (4.9618922e-07
                 + t * (-6.1059365e-09
                     + t * (3.9401551e-11 + t * (-1.2588129e-13 + t * (1.6688280e-16)))));
         let ppol = 1. + t * (3.6182989e-03 + t * (-1.3603273e-05 + ppol));
-        (29.93 / pow(ppol, 4.0)) + (0.96 * t) - 14.8
+        (29.93 / fourth(ppol)) + (0.96 * t) - 14.8
     }
 }
 
@@ -177,7 +262,7 @@ pub fn vappres(t: f64) -> f64 {
     let pol = t * (4.3884180e-09 + (t * (-2.988388e-11 + pol)));
     let pol = t * (7.8736169e-05 + (t * (-6.111796e-07 + pol)));
     let pol = 0.99999683 + (t * (-9.082695e-03 + pol));
-    6.1078 / pow(pol, 8.0)
+    6.1078 / polynomial_power::<8>(pol)
 }
 
 /// Mixing ratio (g/kg) of saturated air at `p` (hPa) and `t` (°C). Pass the

@@ -434,13 +434,11 @@ impl Profile {
         // SHARPpy fills an *uninitialised* array and only computes cells with
         // b >= t; we take the max over the computed cells only.
         let mut max_shear = f64::NAN;
+        let upper_winds: Vec<_> = ptops.iter().map(|&p| self.components(p)).collect();
         for (b, &pb) in pbots.iter().enumerate() {
-            for (t, &pt) in ptops.iter().enumerate() {
-                if b < t {
-                    continue;
-                }
-                let (u, v) = self.wind_shear_raw(pb, pt);
-                let m = mag(u, v);
+            let (ub, vb) = self.components(pb);
+            for &(ut, vt) in upper_winds.iter().take(b + 1) {
+                let m = mag(ut - ub, vt - vb);
                 if !m.is_nan() && (max_shear.is_nan() || m > max_shear) {
                     max_shear = m;
                 }

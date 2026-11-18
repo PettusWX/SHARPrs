@@ -438,14 +438,7 @@ impl Profile {
         }
 
         // environmental temperature levels
-        let p0c = self.temp_lvl_raw(0., false);
-        let pm10c = self.temp_lvl_raw(-10., false);
-        let pm20c = self.temp_lvl_raw(-20., false);
-        let pm30c = self.temp_lvl_raw(-30., false);
-        let hgt0c = self.hght(p0c);
-        let hgtm10c = self.hght(pm10c);
-        let hgtm20c = self.hght(pm20c);
-        let hgtm30c = self.hght(pm30c);
+        let [(p0c, hgt0c), (pm10c, hgtm10c), (pm20c, hgtm20c), (pm30c, hgtm30c)] = *self.parcel_temperature_levels();
         pcl.p0c = p0c;
         pcl.pm10c = pm10c;
         pcl.pm20c = pm20c;
@@ -794,7 +787,7 @@ impl Profile {
         // environment: sample pressures, heights and the env term
         let owned;
         let (pp, hh, env): (&[f64], &[f64], &[f64]) = match sfc {
-            Some((g, n)) => (&g.p[..n], &g.hght(self)[..n], &g.dry_env(self)[..n]),
+            Some((g, n)) => (&g.p[..n], &g.hght(self)[..n], &[]),
             None => {
                 let pp = arange(pbot, blupper - 1., -1.);
                 let (hh, tt, dd) = self.many_htd(&pp);
@@ -828,7 +821,7 @@ impl Profile {
                 Some(w) if !theta_parcel.is_nan() => thermo::virtemp_w(theta_parcel, w),
                 _ => f64::NAN,
             };
-            let tv_env = env[k];
+            let tv_env = match sfc { Some((g, _)) => g.dry_env_at(self, k), None => env[k] };
             (tmp1 - tv_env) / thermo::ctok(tv_env)
         };
         // select_sum(lyre, < 0): the negative layers, pairwise-summed in order
@@ -989,68 +982,48 @@ impl Profile {
     /// Effective inflow layer (pbot, ptop) in hPa: the first contiguous
     /// layer, from the surface up, of parcels with CAPE >= 100 J/kg and
     /// CIN > -250 J/kg.
-    pub(crate) fn effective_inflow_layer_raw(&self, mucape: f64, mucinh: f64) -> (f64, f64) {
-        let (ecape, ecinh) = (100., -250.);
-        let mut pbot = NAN;
-        let mut ptop = NAN;
-        if mucape != 0. && mucape >= ecape && mucinh > ecinh {
-            let energies = |i: usize| self.cape_fast(self.pres[i], self.tmpc[i], self.dwpc[i], false);
-            let Some(bptr) = self.first_level(self.sfc..self.top, |i| {
-                let (cape, cin) = energies(i);
-                cape >= ecape && cin > ecinh
-            }) else {
-                return (NAN, NAN);
-            };
-            pbot = self.pres[bptr];
-            if pbot.is_nan() {
-                return (NAN, NAN);
-            }
-            let top = self.first_level(bptr + 1..self.top, |i| {
-                // SHARPpy quirk: `if not dwpc or not tmpc` also skips levels
-                // where T or Td is exactly 0 °C
-                if self.dwpc[i].is_nan() || self.tmpc[i].is_nan() || self.dwpc[i] == 0. || self.tmpc[i] == 0. {
-                    return false;
-                }
-                // A masked result satisfies neither inequality on its own.
-                let (cape, cin) = energies(i);
-                cape < ecape || cin <= ecinh
-            });
-            if let Some(i) = top {
-                let mut j = 1;
-                while self.dwpc[i - j].is_nan() && self.tmpc[i - j].is_nan() {
-                    j += 1;
-                }
-                ptop = self.pres[i - j];
-                if ptop > pbot {
-                    ptop = pbot;
-                }
-            }
-        }
-        (pbot, ptop)
-    }
+    pub(crate) fn inflow_pressures(&self, cancelled: &std::sync::atomic::AtomicBool, parallel: bool) -> Option<(f64, f64)> {
+        use rayon::prelude::*;
+        use std::sync::atomic::Ordering;
 
-    /// First index in `range` satisfying `pred` (evaluated in order). For
-    /// large (high-resolution) profiles the predicate (a full parcel ascent)
-    /// is evaluated speculatively in parallel blocks; the result is the same
-    /// as the sequential scan.
-    fn first_level(&self, range: std::ops::Range<usize>, pred: impl Fn(usize) -> bool + Sync) -> Option<usize> {
-        const PARALLEL_MIN_LEVELS: usize = 400;
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
-        if self.len() < PARALLEL_MIN_LEVELS || threads < 2 {
-            return range.into_iter().find(|&i| pred(i));
-        }
-        let mut start = range.start;
-        while start < range.end {
-            let end = (start + threads).min(range.end);
-            let hits: Vec<bool> = std::thread::scope(|s| {
-                let pred = &pred;
-                let handles: Vec<_> = (start..end).map(|i| s.spawn(move || pred(i))).collect();
-                handles.into_iter().map(|h| h.join().unwrap_or(false)).collect()
-            });
-            if let Some(k) = hits.iter().position(|&h| h) {
-                return Some(start + k);
+        let mut bottom = None;
+        let mut energies = Vec::new();
+        // Evaluate neighboring parcels together, then inspect them in pressure
+        // order. Stop launching ascents when the most-unstable parcel rules out inflow.
+        let block = if parallel { 8 } else { 1 };
+        for start in (self.sfc..self.top).step_by(block) {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
             }
-            start = end;
+            let end = (start + block).min(self.top);
+            let lift = |i: usize| self.cape_fast(self.pres[i], self.tmpc[i], self.dwpc[i], false);
+            if parallel {
+                (start..end).into_par_iter().map(lift).collect_into_vec(&mut energies);
+            } else {
+                energies.clear();
+                energies.push(lift(start));
+            }
+            for (i, &(cape, cin)) in (start..end).zip(&energies) {
+                if let Some(pbot) = bottom {
+                    let (t, td) = (self.tmpc[i], self.dwpc[i]);
+                    if t.is_nan() || td.is_nan() || t == 0. || td == 0. {
+                        continue;
+                    }
+                    if cape < 100. || cin <= -250. {
+                        let mut j = i - 1;
+                        while self.dwpc[j].is_nan() && self.tmpc[j].is_nan() {
+                            j -= 1;
+                        }
+                        let top = self.pres[j];
+                        return if top.is_nan() { None } else { Some((pbot, top.min(pbot))) };
+                    }
+                } else if cape >= 100. && cin > -250. {
+                    if self.pres[i].is_nan() {
+                        return None;
+                    }
+                    bottom = Some(self.pres[i]);
+                }
+            }
         }
         None
     }
