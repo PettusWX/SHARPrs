@@ -1,0 +1,24 @@
+[package]
+name = "sharprs-render"
+description = "SHARPpy-style sounding display renderer (skew-T, hodograph, indices) for SHARPrs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+include = ["src/**", "fonts/**", "Cargo.toml"]
+
+[dependencies]
+# Background thermodynamics (mixing-ratio lines) come from the physics crate.
+sharprs-core = { workspace = true }
+# Raster backend: anti-aliased paths, PNG encoding.
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd", "png-format"] }
+# Font loading + FreeType-compatible autohinting of glyph outlines.
+skrifa = "0.44"
+# Exact-area coverage rasterizer for glyph outlines (same approach as FreeType's "smooth" rasterizer).
+ab_glyph_rasterizer = "0.1.10"
+
+[dependencies.serde]
+version = "1"
+optional = true
+features = ["derive"]

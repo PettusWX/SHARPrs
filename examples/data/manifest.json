@@ -1,0 +1,22 @@
+{
+  "description": "Sample gallery with the Omaha observation.",
+  "soundings": [
+    {
+      "id": "sharppy_2014-06-16_19z_oax_pilger",
+      "file": "sharppy/14061619.OAX",
+      "format": "spc",
+      "title": "Observed 2014-06-16 19Z — Pilger, NE twin EF4s (2014-06-16) — OAX",
+      "kind": "observed",
+      "category": "severe",
+      "event": "Pilger, NE twin EF4s (2014-06-16)",
+      "station": "OAX",
+      "station_name": "OAX Omaha/Valley, NE",
+      "init_time": null,
+      "forecast_hour": 0,
+      "valid_time": "2014-06-16T19:00:00Z",
+      "source_url": "https://github.com/sharppy/SHARPpy/tree/main/examples/data/14061619.OAX",
+      "attribution": "SHARPpy sample data, BSD-3-Clause, (c) the SHARPpy developers",
+      "note": "SHARPpy sample: special 19Z OAX sounding shortly before the Pilger twin tornadoes."
+    }
+  ]
+}

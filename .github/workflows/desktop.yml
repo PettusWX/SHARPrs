@@ -1,0 +1,33 @@
+name: Build desktop packages
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Windows app and CLI
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release --locked -p sharprs-desktop -p sharprs-cli
+          bash packaging/package.sh windows-x64 target/release
+      - name: Build universal Mac app and CLI
+        if: runner.os == 'macOS'
+        run: |
+          for arch in aarch64 x86_64; do
+            rustup target add "${arch}-apple-darwin"
+            cargo build --release --locked --target "${arch}-apple-darwin" -p sharprs-desktop -p sharprs-cli
+          done
+          bash packaging/package.sh macos-universal target/aarch64-apple-darwin/release target/x86_64-apple-darwin/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHARPrs-${{ runner.os }}
+          path: target/dist/*.zip

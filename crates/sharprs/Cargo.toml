@@ -1,0 +1,18 @@
+[package]
+name = "sharprs"
+description = "SHARPrs: SHARPpy-compatible sounding analysis and SPC-style rendering in pure Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sharprs-core = { workspace = true }
+sharprs-io = { workspace = true }
+sharprs-render = { workspace = true }
+
+ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
+
+[features]
+observations = ["dep:ureq"]

@@ -1,0 +1,18 @@
+[package]
+name = "sharprs-cli"
+description = "Command-line interface for SHARPrs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sharprs"
+path = "src/main.rs"
+
+[dependencies]
+sharprs = { path = "../sharprs", features = ["observations"] }
+sharprs-core = { workspace = true, features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
